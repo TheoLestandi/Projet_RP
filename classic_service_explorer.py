@@ -1,115 +1,128 @@
 from __future__ import annotations
 
+import subprocess
 from typing import Any, Dict, List, Optional
 
 
-# Known Bluetooth Classic service UUIDs → human-readable profile names
 _KNOWN_PROFILES: Dict[str, str] = {
     "00001101-0000-1000-8000-00805f9b34fb": "Serial Port Profile (SPP / RFCOMM)",
-    "00001103-0000-1000-8000-00805f9b34fb": "Dial-up Networking (DUN)",
     "00001108-0000-1000-8000-00805f9b34fb": "Headset (HSP)",
     "0000110b-0000-1000-8000-00805f9b34fb": "Audio Sink (A2DP Sink)",
     "0000110a-0000-1000-8000-00805f9b34fb": "Audio Source (A2DP Source)",
     "0000110e-0000-1000-8000-00805f9b34fb": "Audio/Video Remote Control (AVRCP)",
     "0000111e-0000-1000-8000-00805f9b34fb": "Handsfree (HFP)",
-    "00001112-0000-1000-8000-00805f9b34fb": "Headset Audio Gateway",
     "00001124-0000-1000-8000-00805f9b34fb": "Human Interface Device (HID)",
     "00001105-0000-1000-8000-00805f9b34fb": "Object Push Profile (OPP)",
     "00001106-0000-1000-8000-00805f9b34fb": "File Transfer Profile (FTP)",
-    "0000112f-0000-1000-8000-00805f9b34fb": "Phonebook Access (PBAP)",
-    "00001132-0000-1000-8000-00805f9b34fb": "Message Access Profile (MAP)",
-    "00001200-0000-1000-8000-00805f9b34fb": "PnP Information",
 }
 
 
 class BluetoothClassicServiceExplorer:
     """
-    Queries the SDP (Service Discovery Protocol) database of a
-    Bluetooth Classic device and prints a human-readable service tree.
-
-    SDP is the Classic equivalent of GATT service discovery in BLE.
-    Every Classic device exposes an SDP server that lists available
-    profiles and their associated RFCOMM channels or L2CAP PSMs.
+    Best-effort Classic service explorer using:
+      - bluetoothctl info <MAC>
+      - sdptool browse <MAC>  (if available)
     """
 
     @staticmethod
     def discover(address: str) -> List[Dict[str, Any]]:
-        """
-        Fetch raw SDP records from *address*.
+        services: List[Dict[str, Any]] = []
 
-        Returns:
-            List of service dictionaries as returned by PyBluez.
+        sdptool_path = subprocess.run(
+            ["which", "sdptool"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if sdptool_path.returncode == 0:
+            browse = subprocess.run(
+                ["sdptool", "browse", address],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
 
-        Raises:
-            RuntimeError: If PyBluez is unavailable or the query fails.
-        """
-        try:
-            import bluetooth  # type: ignore[import]
-        except ImportError as exc:
-            raise RuntimeError(
-                "PyBluez is not installed. Run: pip install PyBluez"
-            ) from exc
+            if browse.returncode == 0:
+                text = browse.stdout
+                blocks = text.split("Service Name:")
+                for block in blocks[1:]:
+                    lines = block.splitlines()
+                    name = lines[0].strip() if lines else "Unnamed service"
+                    port: Optional[int] = None
+                    uuid_list: List[str] = []
 
-        try:
-            services: List[Dict[str, Any]] = bluetooth.find_service(address=address)
-        except OSError as exc:
-            raise RuntimeError(
-                f"SDP query failed for {address}: {exc}\n"
-                "Make sure the device is powered on and in range."
-            ) from exc
+                    for line in lines:
+                        stripped = line.strip()
+                        if stripped.lower().startswith("service rechandle"):
+                            continue
+                        if stripped.lower().startswith("channel:"):
+                            raw = stripped.split(":", 1)[1].strip()
+                            try:
+                                port = int(raw)
+                            except ValueError:
+                                port = None
+
+                        for uuid in _KNOWN_PROFILES.keys():
+                            if uuid.lower() in stripped.lower():
+                                uuid_list.append(uuid)
+
+                    services.append(
+                        {
+                            "name": name,
+                            "host": address,
+                            "port": port,
+                            "service-classes": uuid_list,
+                            "profiles": [],
+                        }
+                    )
 
         return services
 
     @classmethod
     def print_services(cls, address: str) -> None:
-        """
-        Discover and print all SDP services of the device at *address*.
+        print("\n=== CLASSIC DEVICE INFO ===")
+        cls._print_btctl_info(address)
 
-        Output format mirrors service_explorer.py for BLE to make the
-        two explorers easy to compare side-by-side.
-        """
-        print(f"\nQuerying SDP records for {address}...")
         services = cls.discover(address)
-
         if not services:
-            print("No SDP services found for this device.")
+            print("\nNo SDP services found (or sdptool unavailable).")
             return
 
         print(f"\n=== SDP SERVICES ({len(services)} found) ===")
-
         for svc in services:
             name: str = svc.get("name") or "Unnamed service"
-            description: Optional[str] = svc.get("description")
-            provider: Optional[str] = svc.get("provider")
-            profiles: List[Any] = svc.get("profiles") or []
-            port: Optional[int] = svc.get("port")
             host: str = svc.get("host") or address
+            port: Optional[int] = svc.get("port")
             service_classes: List[str] = svc.get("service-classes") or []
 
             print(f"\n[Service] {name}")
-
-            if description:
-                print(f"  Description : {description}")
-            if provider:
-                print(f"  Provider    : {provider}")
-            if host:
-                print(f"  Host        : {host}")
+            print(f"  Host        : {host}")
             if port is not None:
                 print(f"  RFCOMM ch.  : {port}")
 
-            # Known profile UUIDs
             for uuid in service_classes:
                 label = _KNOWN_PROFILES.get(uuid.lower(), uuid)
                 print(f"  ├─ Profile  : {label}")
 
-            for profile_uuid, version in profiles:
-                major, minor = version >> 8, version & 0xFF
-                label = _KNOWN_PROFILES.get(profile_uuid.lower(), profile_uuid)
-                print(f"  ├─ Version  : {label} v{major}.{minor}")
-
-        print()
-
     @staticmethod
     def resolve_profile_name(uuid: str) -> str:
-        """Return a human-readable profile name for a known UUID."""
         return _KNOWN_PROFILES.get(uuid.lower(), uuid)
+
+    @staticmethod
+    def _print_btctl_info(address: str) -> None:
+        result = subprocess.run(
+            ["bluetoothctl", "info", address],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        text = result.stdout.strip()
+        if not text:
+            print(f"No bluetoothctl info available for {address}.")
+            return
+
+        print(text)

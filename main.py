@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from typing import List, Optional
 
 from models import ClassifiedDevice, DeviceInfo, DeviceType
@@ -16,6 +17,19 @@ from classifier import BluetoothClassifier
 # ---------------------------------------------------------------------------
 # Shared display helpers
 # ---------------------------------------------------------------------------
+
+def power_on_bluetooth() -> None:
+    try:
+        subprocess.run(
+            ["bluetoothctl", "power", "on"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        print("Bluetooth adapter powered on.")
+    except Exception as exc:
+        print(f"Failed to power on Bluetooth: {exc}")
 
 
 def bytes_to_pretty_string(data: bytes) -> str:
@@ -34,8 +48,22 @@ def parse_hex_input(user_input: str) -> bytes:
     return bytes.fromhex(cleaned)
 
 
+def power_off_bluetooth() -> None:
+    try:
+        subprocess.run(
+            ["bluetoothctl", "power", "off"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        print("Bluetooth adapter powered off.")
+    except Exception as exc:
+        print(f"Failed to power off Bluetooth: {exc}")
+
+
 # ---------------------------------------------------------------------------
-# BLE device menu (unchanged logic, minor cosmetic tweaks)
+# BLE device menu
 # ---------------------------------------------------------------------------
 
 
@@ -136,12 +164,10 @@ def classic_device_menu(
 ) -> None:
     while connection.is_connected():
         print("\n--- CLASSIC DEVICE MENU ---")
-        print("1. Discover SDP services")
-        print("2. Send text (UTF-8)")
-        print("3. Send HEX bytes")
-        print("4. Receive data")
-        print("5. Disconnect")
-        print("6. Back to main menu")
+        print("1. Show device info / SDP services")
+        print("2. Check connection state")
+        print("3. Disconnect")
+        print("4. Back to main menu")
 
         choice = input("Choice: ").strip()
 
@@ -150,29 +176,17 @@ def classic_device_menu(
                 BluetoothClassicServiceExplorer.print_services(address)
 
             elif choice == "2":
-                text = input("Text to send: ")
-                connection.send_text(text)
-                print("Sent.")
+                if connection.is_connected():
+                    print("Classic device is connected.")
+                else:
+                    print("Classic device is not connected.")
 
             elif choice == "3":
-                hex_data = input("HEX bytes to send (e.g. 01 ff a0): ")
-                data = parse_hex_input(hex_data)
-                connection.send(data)
-                print("Sent.")
-
-            elif choice == "4":
-                buf = input("Buffer size in bytes (default 1024): ").strip()
-                size = int(buf) if buf.isdigit() else 1024
-                data = connection.receive(size)
-                print("\nReceived:")
-                print(bytes_to_pretty_string(data))
-
-            elif choice == "5":
                 connection.disconnect()
                 print("Disconnected.")
                 break
 
-            elif choice == "6":
+            elif choice == "4":
                 break
 
             else:
@@ -191,8 +205,6 @@ async def connect_and_explore(
     device: ClassifiedDevice,
     ble_manager: BluetoothConnectionManager,
 ) -> None:
-    """Route the user to the right connection menu based on device type."""
-
     if device.device_type == DeviceType.BLE:
         await _connect_ble(device, ble_manager)
 
@@ -232,7 +244,6 @@ async def _connect_ble(
 def _connect_classic(device: ClassifiedDevice) -> None:
     connection = BluetoothClassicConnection()
 
-    # Try to auto-detect RFCOMM channel via SDP first
     print(f"\nQuerying SDP to find RFCOMM channel for {device.display_name()}...")
     try:
         port = BluetoothClassicConnection.find_rfcomm_port(device.address)
@@ -262,12 +273,11 @@ def _connect_classic(device: ClassifiedDevice) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Stand-alone scan menus (quick scan without classification)
+# Stand-alone scan menus
 # ---------------------------------------------------------------------------
 
 
 async def quick_ble_scan(manager: BluetoothConnectionManager) -> None:
-    """Scan BLE only and connect directly."""
     scanner = BluetoothScanner()
     print("\nScanning for BLE devices...")
     devices = await scanner.scan(timeout=5.0)
@@ -303,7 +313,6 @@ async def quick_ble_scan(manager: BluetoothConnectionManager) -> None:
 
 
 def quick_classic_scan() -> None:
-    """Scan Classic only (blocking) and connect directly."""
     scanner = BluetoothClassicScanner()
     print("\nScanning for Classic Bluetooth devices (~10 s)...")
     try:
@@ -350,59 +359,71 @@ def quick_classic_scan() -> None:
 
 async def main() -> None:
     ble_manager = BluetoothConnectionManager()
+    power_on_bluetooth()
+    try:
+        while True:
+            print("\n╔══════════════════════════════╗")
+            print("║   BLE + CLASSIC CONSOLE      ║")
+            print("╠══════════════════════════════╣")
+            print("║ 1. Scan ALL (BLE + Classic)  ║")
+            print("║ 2. Scan BLE only             ║")
+            print("║ 3. Scan Classic only         ║")
+            print("║ 4. Exit                      ║")
+            print("╚══════════════════════════════╝")
 
-    while True:
-        print("\n╔══════════════════════════════╗")
-        print("║   BLE + CLASSIC CONSOLE      ║")
-        print("╠══════════════════════════════╣")
-        print("║ 1. Scan ALL (BLE + Classic)  ║")
-        print("║ 2. Scan BLE only             ║")
-        print("║ 3. Scan Classic only         ║")
-        print("║ 4. Exit                      ║")
-        print("╚══════════════════════════════╝")
+            choice = input("Choice: ").strip()
 
-        choice = input("Choice: ").strip()
+            if choice == "1":
+                classifier = BluetoothClassifier()
+                try:
+                    devices = await classifier.classify()
+                except Exception as exc:
+                    print(f"Scan error: {exc}")
+                    continue
 
-        if choice == "1":
-            classifier = BluetoothClassifier()
-            try:
-                devices = await classifier.classify()
-            except Exception as exc:
-                print(f"Scan error: {exc}")
-                continue
+                if not devices:
+                    print("No devices found.")
+                    continue
 
-            if not devices:
-                print("No devices found.")
-                continue
+                BluetoothClassifier.print_summary(devices)
 
-            BluetoothClassifier.print_summary(devices)
+                raw = input("Choose a device number (or q to cancel): ").strip()
+                if raw.lower() == "q" or not raw.isdigit():
+                    continue
 
-            raw = input("Choose a device number (or q to cancel): ").strip()
-            if raw.lower() == "q" or not raw.isdigit():
-                continue
+                index = int(raw)
+                if not (1 <= index <= len(devices)):
+                    print("Number out of range.")
+                    continue
 
-            index = int(raw)
-            if not (1 <= index <= len(devices)):
-                print("Number out of range.")
-                continue
+                await connect_and_explore(devices[index - 1], ble_manager)
 
-            await connect_and_explore(devices[index - 1], ble_manager)
+            elif choice == "2":
+                await quick_ble_scan(ble_manager)
 
-        elif choice == "2":
-            await quick_ble_scan(ble_manager)
+            elif choice == "3":
+                await asyncio.to_thread(quick_classic_scan)
 
-        elif choice == "3":
-            await asyncio.to_thread(quick_classic_scan)
+            elif choice == "4":
+                print("Goodbye.")
+                break
 
-        elif choice == "4":
+            else:
+                print("Invalid choice.")
+
+    finally:
+        try:
             if ble_manager.is_connected():
                 await ble_manager.disconnect()
-            print("Goodbye.")
-            break
+        except Exception as exc:
+            print(f"BLE disconnect error during shutdown: {exc}")
 
-        else:
-            print("Invalid choice.")
+        power_off_bluetooth()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nProgram interrupted by user.")
+        power_off_bluetooth()

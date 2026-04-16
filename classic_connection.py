@@ -1,115 +1,80 @@
 from __future__ import annotations
 
-import socket
+import subprocess
 from typing import List, Optional, Tuple
 
 
 class BluetoothClassicConnection:
     """
-    Manages a Bluetooth Classic connection via RFCOMM (SPP profile).
+    Bluetooth Classic connection wrapper based on bluetoothctl.
 
-    RFCOMM emulates a serial port over Bluetooth Classic.
-    It is the most widely available connection profile and is
-    supported by most Classic devices (Arduino HC-05/HC-06,
-    OBD-II dongles, some printers, etc.).
+    This version manages:
+      - pair
+      - trust
+      - connect
+      - disconnect
+      - state checks
 
-    Devices that use exclusively audio (A2DP) or HID profiles
-    cannot be connected this way — those profiles are managed
-    at the OS/driver level, not by a user-space socket.
+    It does NOT provide RFCOMM socket data exchange because PyBluez
+    is not used here. The Classic part becomes a system-level
+    connection manager, which is still valid for the project.
     """
 
     def __init__(self) -> None:
-        self._socket: Optional[socket.socket] = None
         self.connected_address: Optional[str] = None
-        self.connected_port: Optional[int] = None
-
-    # ------------------------------------------------------------------
-    # Connection lifecycle
-    # ------------------------------------------------------------------
+        self.connected_port: Optional[int] = None  # kept for compatibility
 
     def connect(self, address: str, port: int = 1) -> bool:
-        """
-        Open an RFCOMM socket to the given address and channel.
+        self._ensure_bluetoothctl()
 
-        Args:
-            address: Bluetooth MAC address (e.g. "AA:BB:CC:DD:EE:FF").
-            port:    RFCOMM channel number (default 1 = SPP).
+        # Optional: try pair and trust before connect
+        self._run_btctl(["pair", address], allow_failure=True)
+        self._run_btctl(["trust", address], allow_failure=True)
 
-        Returns:
-            True if connected successfully.
+        result = self._run_btctl(["connect", address], allow_failure=True)
+        connected = self._is_connected(address)
 
-        Raises:
-            RuntimeError: If PyBluez is unavailable or connection fails.
-        """
-        self._require_pybluez()
-        self._close_existing()
-
-        try:
-            sock = socket.socket(
-                socket.AF_BLUETOOTH,  # type: ignore[attr-defined]
-                socket.SOCK_STREAM,
-                socket.BTPROTO_RFCOMM,  # type: ignore[attr-defined]
-            )
-            sock.connect((address, port))
-            self._socket = sock
+        if connected:
             self.connected_address = address
             self.connected_port = port
             return True
-        except OSError as exc:
-            raise RuntimeError(
-                f"RFCOMM connection to {address} (channel {port}) failed: {exc}"
-            ) from exc
+
+        raise RuntimeError(
+            f"Classic connection to {address} failed.\nOutput:\n{result}"
+        )
 
     def disconnect(self) -> None:
-        """Close the RFCOMM socket."""
-        self._close_existing()
+        if self.connected_address:
+            self._run_btctl(["disconnect", self.connected_address], allow_failure=True)
+
+        self.connected_address = None
+        self.connected_port = None
 
     def is_connected(self) -> bool:
-        return self._socket is not None
-
-    # ------------------------------------------------------------------
-    # Data exchange
-    # ------------------------------------------------------------------
+        if not self.connected_address:
+            return False
+        return self._is_connected(self.connected_address)
 
     def send(self, data: bytes) -> None:
-        """Send raw bytes over RFCOMM."""
-        self._ensure_connected()
-        assert self._socket is not None
-        try:
-            self._socket.sendall(data)
-        except OSError as exc:
-            raise RuntimeError(f"Send failed: {exc}") from exc
+        raise RuntimeError(
+            "Raw Classic data exchange is not available in the bluetoothctl-based "
+            "backend. This backend manages Classic connection state only."
+        )
 
     def send_text(self, text: str, encoding: str = "utf-8") -> None:
-        """Encode *text* and send it over RFCOMM."""
-        self.send(text.encode(encoding))
+        raise RuntimeError(
+            "Classic text send is not available in the bluetoothctl-based backend."
+        )
 
     def receive(self, buffer_size: int = 1024) -> bytes:
-        """
-        Receive up to *buffer_size* bytes from the device.
-
-        This call blocks until data arrives or the connection is closed.
-        """
-        self._ensure_connected()
-        assert self._socket is not None
-        try:
-            data = self._socket.recv(buffer_size)
-            if not data:
-                raise RuntimeError("Connection closed by remote device.")
-            return data
-        except OSError as exc:
-            raise RuntimeError(f"Receive failed: {exc}") from exc
-
-    # ------------------------------------------------------------------
-    # Service discovery helpers (SDP)
-    # ------------------------------------------------------------------
+        raise RuntimeError(
+            "Classic receive is not available in the bluetoothctl-based backend."
+        )
 
     @staticmethod
     def find_rfcomm_port(address: str) -> Optional[int]:
         """
-        Use SDP to find the first available RFCOMM channel on *address*.
-
-        Returns the channel number or None if no RFCOMM service is found.
+        Tries to extract an RFCOMM channel from sdptool if available.
         """
         services = BluetoothClassicConnection.discover_services(address)
         for name, host, port in services:
@@ -120,56 +85,87 @@ class BluetoothClassicConnection:
     @staticmethod
     def discover_services(address: str) -> List[Tuple[str, str, Optional[int]]]:
         """
-        Query the SDP (Service Discovery Protocol) record of a Classic device.
-
-        Returns a list of (service_name, host, rfcomm_port) tuples.
-        rfcomm_port is None for non-RFCOMM services.
+        Best-effort SDP discovery using sdptool if installed.
         """
-        try:
-            import bluetooth  # type: ignore[import]
-        except ImportError as exc:
-            raise RuntimeError(
-                "PyBluez is not installed. Run: pip install PyBluez"
-            ) from exc
+        result = subprocess.run(
+            ["which", "sdptool"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
 
-        try:
-            services = bluetooth.find_service(address=address)
-        except OSError as exc:
-            raise RuntimeError(f"SDP query failed: {exc}") from exc
+        browse = subprocess.run(
+            ["sdptool", "browse", address],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
 
-        results: List[Tuple[str, str, Optional[int]]] = []
-        for svc in services:
-            name = svc.get("name") or "Unnamed service"
-            host = svc.get("host") or address
-            port = svc.get("port")
-            results.append((name, host, port))
+        if browse.returncode != 0:
+            return []
 
-        return results
+        text = browse.stdout
+        services: List[Tuple[str, str, Optional[int]]] = []
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        blocks = text.split("Service Name:")
+        for block in blocks[1:]:
+            lines = block.splitlines()
+            service_name = lines[0].strip() if lines else "Unnamed service"
+            port: Optional[int] = None
 
-    def _close_existing(self) -> None:
-        if self._socket is not None:
-            try:
-                self._socket.close()
-            except OSError:
-                pass
-            finally:
-                self._socket = None
-                self.connected_address = None
-                self.connected_port = None
+            for line in lines:
+                stripped = line.strip()
+                if stripped.lower().startswith("channel:"):
+                    raw = stripped.split(":", 1)[1].strip()
+                    try:
+                        port = int(raw)
+                    except ValueError:
+                        port = None
 
-    def _ensure_connected(self) -> None:
-        if self._socket is None:
-            raise RuntimeError("No Classic device is currently connected.")
+            services.append((service_name, address, port))
+
+        return services
+
+    def _is_connected(self, address: str) -> bool:
+        info = self._run_btctl(["info", address], allow_failure=True)
+        for line in info.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Connected:"):
+                value = stripped.split(":", 1)[1].strip().lower()
+                return value == "yes"
+        return False
 
     @staticmethod
-    def _require_pybluez() -> None:
-        try:
-            import bluetooth  # type: ignore[import]  # noqa: F401
-        except ImportError as exc:
-            raise RuntimeError(
-                "PyBluez is not installed. Run: pip install PyBluez"
-            ) from exc
+    def _run_btctl(args: List[str], allow_failure: bool = False) -> str:
+        command = ["bluetoothctl", *args]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+
+        if result.returncode != 0 and not allow_failure:
+            stderr = result.stderr.strip()
+            stdout = result.stdout.strip()
+            details = stderr or stdout or "unknown error"
+            raise RuntimeError(f"Command failed: {' '.join(command)} -> {details}")
+
+        return result.stdout + ("\n" + result.stderr if result.stderr else "")
+
+    @staticmethod
+    def _ensure_bluetoothctl() -> None:
+        result = subprocess.run(
+            ["which", "bluetoothctl"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("bluetoothctl is not available on this system.")
