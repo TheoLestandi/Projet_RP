@@ -17,11 +17,14 @@ class BluetoothScanner:
 
             seen_addresses.add(address)
 
+            name = getattr(device, "name", "") or "Unknown"
+            rssi = getattr(device, "rssi", None)
+
             results.append(
                 DeviceInfo(
-                    name=getattr(device, "name", "") or "Unknown",
+                    name=name,
                     address=address,
-                    rssi=getattr(device, "rssi", None),
+                    rssi=rssi,
                 )
             )
 

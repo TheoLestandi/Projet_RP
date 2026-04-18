@@ -1,2 +1,1 @@
-bleak
-pybluez2
+bleak==3.0.1
